@@ -1,0 +1,316 @@
+﻿@page "/"
+@rendermode InteractiveServer
+@using System.Globalization
+@using System.Net.Http.Json
+@using System.Text.Json
+@using Contracts
+@implements IAsyncDisposable
+@inject IHttpClientFactory HttpClientFactory
+
+<PageTitle>Gateway Analytics</PageTitle>
+
+<div class="dashboard-page">
+    <header class="dashboard-header">
+        <h1>Gateway Analytics</h1>
+        <div class="dashboard-header-actions">
+            <span class="status-pill">@GetStatusText()</span>
+            <button class="refresh-button" @onclick="LoadAsync" disabled="@_isLoading">Refresh</button>
+        </div>
+    </header>
+
+    @if (_errorMessage is not null)
+    {
+        <section class="error-panel">
+            <h2>Dashboard unavailable</h2>
+            <p>@_errorMessage</p>
+        </section>
+    }
+    else if (_snapshot is null)
+    {
+        <section class="empty-panel">
+            <h2>Waiting for generated traffic</h2>
+            <p>The load generator starts after the gateway comes online. This page refreshes automatically every five seconds.</p>
+        </section>
+    }
+    else
+    {
+        <section class="kpi-grid">
+            <article class="kpi-card">
+                <span>Total requests</span>
+                <strong>@_snapshot.Overview.TotalRequests.ToString("N0", CultureInfo.InvariantCulture)</strong>
+                <small>Last @_snapshot.WindowMinutes minutes</small>
+            </article>
+            <article class="kpi-card">
+                <span>Average latency</span>
+                <strong>@FormatMs(_snapshot.Overview.AverageLatencyMs)</strong>
+                <small>Across all proxied routes</small>
+            </article>
+            <article class="kpi-card accent">
+                <span>P95 latency</span>
+                <strong>@FormatMs(_snapshot.Overview.P95LatencyMs)</strong>
+                <small>Tail latency from ClickHouse</small>
+            </article>
+            <article class="kpi-card danger">
+                <span>Error rate</span>
+                <strong>@FormatPercent(_snapshot.Overview.ErrorRate)</strong>
+                <small>HTTP 5xx only</small>
+            </article>
+        </section>
+
+        <section class="panel-grid">
+            <article class="panel">
+                <div class="panel-header">
+                    <div>
+                        <p class="eyebrow">Throughput</p>
+                        <h2>Requests per minute</h2>
+                    </div>
+                    <span>@_snapshot.Throughput.Count points</span>
+                </div>
+                @if (_snapshot.Throughput.Count == 0)
+                {
+                    <p class="panel-empty">No request volume has been recorded yet.</p>
+                }
+                else
+                {
+                    <svg class="line-chart" viewBox="0 0 640 220" preserveAspectRatio="none" role="img" aria-label="Throughput chart">
+                        @foreach (var gridLine in Enumerable.Range(1, 4))
+                        {
+                            <line class="grid-line" x1="0" y1="@(gridLine * 44)" x2="640" y2="@(gridLine * 44)"></line>
+                        }
+                        <path class="line-path" d="@BuildLinePath(_snapshot.Throughput.Select(point => (double)point.TotalRequests).ToList())"></path>
+                    </svg>
+                }
+            </article>
+
+            <article class="panel">
+                <div class="panel-header">
+                    <div>
+                        <p class="eyebrow">Reliability</p>
+                        <h2>Error rate by service</h2>
+                    </div>
+                </div>
+                @if (_snapshot.ErrorRates.Count == 0)
+                {
+                    <p class="panel-empty">The intentionally flaky checkout endpoint has not produced any signal yet.</p>
+                }
+                else
+                {
+                    <div class="error-list">
+                        @foreach (var row in AggregateErrorRates(_snapshot.ErrorRates))
+                        {
+                            <div class="error-list-row">
+                                <div>
+                                    <strong>@row.Service</strong>
+                                    <span>@row.ErrorCount / @row.TotalRequests errors</span>
+                                </div>
+                                <strong class="error-rate">@FormatPercent(row.ErrorRate)</strong>
+                            </div>
+                        }
+                    </div>
+                }
+            </article>
+        </section>
+
+        <section class="panel-grid">
+            <article class="panel">
+                <div class="panel-header">
+                    <div>
+                        <p class="eyebrow">Latency</p>
+                        <h2>p95 latency by route</h2>
+                    </div>
+                </div>
+                <div class="route-bars">
+                    @foreach (var row in _snapshot.RouteLatency)
+                    {
+                        <div class="route-bar-row">
+                            <div class="route-bar-text">
+                                <strong>@row.RoutePattern</strong>
+                                <span>@row.UpstreamService • @row.RequestCount requests • p50 @FormatMs(row.P50LatencyMs) • p99 @FormatMs(row.P99LatencyMs)</span>
+                            </div>
+                            <div class="route-bar-visual">
+                                <div class="route-bar-fill" style="@($"width:{ComputeBarWidth(row.P95LatencyMs, _snapshot.RouteLatency)}%")"></div>
+                            </div>
+                            <strong>p95 @FormatMs(row.P95LatencyMs)</strong>
+                        </div>
+                    }
+                </div>
+            </article>
+
+            <article class="panel">
+                <div class="panel-header">
+                    <div>
+                        <p class="eyebrow">Tail requests</p>
+                        <h2>Slowest captured requests</h2>
+                    </div>
+                </div>
+                <div class="slow-requests">
+                    @foreach (var row in _snapshot.SlowRequests)
+                    {
+                        <div class="slow-request-row">
+                            <div class="slow-request-main">
+                                <strong>@row.RoutePattern</strong>
+                                <span>@row.UpstreamService • @row.StatusCode • @FormatMs(row.DurationMs)</span>
+                            </div>
+                            <code>@ShortTrace(row.TraceId)</code>
+                            @if (!string.IsNullOrWhiteSpace(row.ErrorMessage))
+                            {
+                                <p>@row.ErrorMessage</p>
+                            }
+                        </div>
+                    }
+                </div>
+            </article>
+        </section>
+    }
+</div>
+
+@code {
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true,
+    };
+
+    private DashboardSnapshot? _snapshot;
+    private string? _errorMessage;
+    private bool _isLoading;
+    private PeriodicTimer? _timer;
+    private CancellationTokenSource? _refreshCts;
+    private DateTimeOffset? _lastRefresh;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _refreshCts = new CancellationTokenSource();
+        _timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+
+        await LoadAsync();
+        _ = RefreshLoopAsync(_refreshCts.Token);
+    }
+
+    private async Task RefreshLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (_timer is not null && await _timer.WaitForNextTickAsync(cancellationToken))
+            {
+                await InvokeAsync(LoadAsync);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task LoadAsync()
+    {
+        if (_isLoading)
+        {
+            return;
+        }
+
+        _isLoading = true;
+        _errorMessage = null;
+
+        try
+        {
+            var client = HttpClientFactory.CreateClient("analytics");
+            _snapshot = await client.GetFromJsonAsync<DashboardSnapshot>("/api/analytics/overview?minutes=60", JsonOptions);
+            _lastRefresh = DateTimeOffset.Now;
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _isLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private string GetStatusText()
+    {
+        if (_isLoading)
+        {
+            return "Refreshing";
+        }
+
+        if (_lastRefresh is null)
+        {
+            return "Waiting for first refresh";
+        }
+
+        return $"Updated {_lastRefresh:HH:mm:ss}";
+    }
+
+    private static IEnumerable<(string Service, long TotalRequests, long ErrorCount, double ErrorRate)>
+        AggregateErrorRates(IReadOnlyList<ErrorRatePoint> rows)
+    {
+        return rows
+            .GroupBy(point => point.UpstreamService)
+            .Select(group =>
+            {
+                var total = group.Sum(p => p.TotalRequests);
+                var errors = group.Sum(p => p.ErrorCount);
+                var rate = total == 0 ? 0d : (double)errors / total;
+                return (Service: group.Key, TotalRequests: total, ErrorCount: errors, ErrorRate: rate);
+            })
+            .OrderByDescending(item => item.ErrorRate);
+    }
+
+    private static string FormatMs(double value) => $"{value:N0} ms";
+
+    private static string FormatPercent(double value) => $"{value:P1}";
+
+    private static string ShortTrace(string traceId)
+    {
+        if (string.IsNullOrWhiteSpace(traceId))
+        {
+            return "trace unavailable";
+        }
+
+        return traceId.Length <= 14
+            ? traceId
+            : $"{traceId[..8]}…{traceId[^4..]}";
+    }
+
+    private static double ComputeBarWidth(double currentValue, IReadOnlyList<RouteLatencySummary> rows)
+    {
+        var max = rows.Count == 0 ? 1 : Math.Max(rows.Max(row => row.P95LatencyMs), 1);
+        return Math.Clamp(currentValue / max * 100, 8, 100);
+    }
+
+    private static string BuildLinePath(IReadOnlyList<double> values)
+    {
+        if (values.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        if (values.Count == 1)
+        {
+            return "M 0 110 L 640 110";
+        }
+
+        var max = Math.Max(values.Max(), 1);
+        var step = 640d / (values.Count - 1);
+        var points = values.Select((value, index) =>
+        {
+            var x = index * step;
+            var y = 200d - (value / max * 180d);
+            return $"{x.ToString("0.##", CultureInfo.InvariantCulture)} {y.ToString("0.##", CultureInfo.InvariantCulture)}";
+        });
+
+        return "M " + string.Join(" L ", points);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_refreshCts is not null)
+        {
+            await _refreshCts.CancelAsync();
+            _refreshCts.Dispose();
+        }
+
+        _timer?.Dispose();
+    }
+}

@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <Sdk Name="Aspire.AppHost.Sdk" Version="13.3.5" />
+
+  <ItemGroup>
+    <ProjectReference Include="..\Gateway\Gateway.csproj" />
+    <ProjectReference Include="..\Products.Api\Products.Api.csproj" />
+    <ProjectReference Include="..\Orders.Api\Orders.Api.csproj" />
+    <ProjectReference Include="..\Analytics.Api\Analytics.Api.csproj" />
+    <ProjectReference Include="..\Dashboard\Dashboard.csproj" />
+    <ProjectReference Include="..\LoadGenerator\LoadGenerator.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.3.5" />
+    <PackageReference Include="Aspire.Hosting.ClickHouse" Version="13.3.5" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsAspireHost>true</IsAspireHost>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
