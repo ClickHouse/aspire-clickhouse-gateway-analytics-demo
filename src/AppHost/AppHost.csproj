@@ -12,7 +12,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.3.5" />
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.6.5" />
     <PackageReference Include="Aspire.Hosting.ClickHouse" Version="13.3.5" />
   </ItemGroup>
 
